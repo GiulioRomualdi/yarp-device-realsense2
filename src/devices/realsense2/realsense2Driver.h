@@ -9,8 +9,10 @@
 #ifndef REALSENSE2_DRIVER_H
 #define REALSENSE2_DRIVER_H
 
+#include <atomic>
 #include <iostream>
 #include <cstring>
+#include <librealsense2/hpp/rs_processing.hpp>
 #include <map>
 #include <mutex>
 
@@ -18,6 +20,7 @@
 #include <yarp/dev/IFrameGrabberControls.h>
 #include <yarp/dev/IFrameGrabberImage.h>
 #include <yarp/os/PeriodicThread.h>
+#include <yarp/sig/Image.h>
 #include <yarp/sig/all.h>
 #include <yarp/sig/Matrix.h>
 #include <yarp/os/Stamp.h>
@@ -30,7 +33,8 @@ class realsense2Driver :
         public yarp::dev::DeviceDriver,
         public yarp::dev::IFrameGrabberControls,
         public yarp::dev::IFrameGrabberImageRaw,
-        public yarp::dev::IRGBDSensor
+        public yarp::dev::IRGBDSensor,
+        public yarp::os::PeriodicThread
 {
 private:
     typedef yarp::sig::ImageOf<yarp::sig::PixelFloat> depthImage;
@@ -41,11 +45,14 @@ private:
 
 public:
     realsense2Driver();
-    ~realsense2Driver() override = default;
+    ~realsense2Driver() override;
 
     // DeviceDriver
     bool open(yarp::os::Searchable& config) override;
     bool close() override;
+
+    // periodic thread
+    void run() override;
 
     // IRGBDSensor
     int    getRgbHeight() override;
@@ -108,8 +115,10 @@ protected:
     inline bool initializeRealsenseDevice();
     inline bool setParams();
 
-    bool        getImage(FlexImage& Frame, Stamp* timeStamp, rs2::frameset& sourceFrame);
-    bool        getImage(depthImage& Frame, Stamp* timeStamp, const rs2::frameset& sourceFrame);
+    bool        configure(yarp::os::Searchable& config);
+
+    bool        getImage(FlexImage& Frame, const rs2::frameset& sourceFrame);
+    bool        getImage(depthImage& Frame, const rs2::frameset& sourceFrame);
     void        updateTransformations();
     bool        pipelineStartup();
     bool        pipelineShutdown();
@@ -117,6 +126,11 @@ protected:
     bool        setFramerate(const int _fps);
     void        fallback();
 
+    virtual double getHigherFrequency() const;
+
+    bool populateImages(const rs2::frameset& frameset);
+    void alignFrame(rs2::frameset& frameset);
+    bool getNewFrame(rs2::frameset& frameset);
 
     // realsense classes
     mutable std::mutex m_mutex;
@@ -132,13 +146,11 @@ protected:
     rs2_extrinsics m_depth_to_color{}, m_color_to_depth{};
     rs2_stream  m_alignment_stream{RS2_STREAM_COLOR};
 
-
     // Data quantization related parameters
     bool                             m_depthQuantizationEnabled{false};
     int                              m_depthDecimalNum{0};
 
-    yarp::os::Stamp m_rgb_stamp;
-    yarp::os::Stamp m_depth_stamp;
+
     mutable std::string m_lastError;
     yarp::dev::RGBDSensorParamParser m_paramParser;
     bool m_verbose;
@@ -149,5 +161,20 @@ protected:
     float m_scale;
     bool m_rotateImage180{false};
     std::vector<cameraFeature_id_t> m_supportedFeatures;
+
+private:
+    std::unique_ptr<rs2::align> m_align;
+
+    std::mutex m_infraredFrameMutex;
+    yarp::sig::ImageOf<yarp::sig::PixelMono> m_infraredFrame;
+    std::atomic_bool m_infraredFrameAvailable{false};
+
+    std::mutex m_rgbdFrameMutex;
+    yarp::sig::FlexImage m_colorFrame;
+    yarp::sig::ImageOf<yarp::sig::PixelFloat> m_depthFrame;
+    yarp::os::Stamp m_rgb_stamp;
+    yarp::os::Stamp m_depth_stamp;
+    std::atomic_bool m_colorFrameAvailable{false};
+    std::atomic_bool m_depthFrameAvailable{false};
 };
 #endif

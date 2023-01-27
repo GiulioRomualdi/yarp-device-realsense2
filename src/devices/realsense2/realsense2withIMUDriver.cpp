@@ -17,12 +17,14 @@
 #include <yarp/math/Math.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <librealsense2/rsutil.h>
 #include <librealsense2/rs.hpp>
 #include <mutex>
+#include "realsense2Driver.h"
 
  /**********************************************************************************************************/
  // This software module is experimental.
@@ -271,7 +273,6 @@ bool realsense2withIMUDriver::pipelineRestart()
     return pipelineStartup();
 }
 
-
 void realsense2Driver::fallback()
 {
     m_cfg.enable_stream(RS2_STREAM_COLOR, m_color_intrin.width, m_color_intrin.height, RS2_FORMAT_RGB8, m_fps);
@@ -282,54 +283,114 @@ void realsense2Driver::fallback()
 }
 #endif
 
+double realsense2withIMUDriver::getHigherFrequency() const
+{
+    return std::max(double(m_fps), m_imuFrequency);
+}
+
 bool realsense2withIMUDriver::open(Searchable& config)
 {
     yCWarning(REALSENSE2WITHIMU) << "This software module is experimental.";
     yCWarning(REALSENSE2WITHIMU) << "It is provided with uncomplete documentation and it may be modified/renamed/removed without any notice.";
 
     string sensor_is = "d435i";
-    bool b = true;
+    bool ret = true;
 
     if (sensor_is == "d435")
     {
-        b &= realsense2Driver::open(config);
-        //m_sensor_has_pose_capabilities = false;
         m_sensor_has_orientation_estimator = false;
+        ret = ret && realsense2Driver::configure(config);
     }
     else if (sensor_is == "d435i")
     {
-        b &= realsense2Driver::open(config);
-        //m_sensor_has_pose_capabilities = false;
         m_sensor_has_orientation_estimator = true;
+
+        const std::string paramName = "imuPeriod";
+        if (!config.check(paramName) || !config.find(paramName).isFloat64())
+        {
+            yCWarning(REALSENSE2WITHIMU) << "Param " + paramName + " is not a double as it should be. Setting 0.033s  by default";
+            m_imuFrequency = 30;
+        }else
+        {
+            m_imuFrequency = 1 / config.find(paramName).asFloat64();
+        }
+
+        // we enable the imu stream and then we configure
         m_cfg.enable_stream(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F);
         m_cfg.enable_stream(RS2_STREAM_GYRO, RS2_FORMAT_MOTION_XYZ32F);
-        b &= pipelineRestart();
+
+        ret = ret && realsense2Driver::configure(config);
     }
-    /*
-    //T265 is very diffcukt to implement without major refactoring.
-    //here some infos, just for reference
-    else if(sensor_is == "t265")
-    {
-        b &= realsense2Driver::open(config);
-        m_sensor_has_pose_capabilities = true;
-        m_sensor_has_orientation_estimator = false;
-        m_cfg.enable_stream(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F);
-        m_cfg.enable_stream(RS2_STREAM_GYRO, RS2_FORMAT_MOTION_XYZ32F);
-        m_cfg.enable_stream(RS2_STREAM_POSE, RS2_FORMAT_6DOF);
-        b &= pipelineRestart();
-    }*/
     else
     {
         yCError(REALSENSE2WITHIMU) << "Unkwnon device";
         return false;
     }
 
-    return b;
+    ret = ret && this->start();
+
+    return ret;
+}
+
+void realsense2withIMUDriver::populateImuMeasurements(const rs2::frameset& frameset)
+{
+    // populate the gyroscope
+    auto fg = frameset.first(RS2_STREAM_GYRO, RS2_FORMAT_MOTION_XYZ32F);
+    rs2::motion_frame gyro = fg.as<rs2::motion_frame>();
+    {
+        std::lock_guard<std::mutex> guard(m_last_gyro_mutex);
+        m_last_gyro = gyro.get_motion_data();
+    }
+
+    // populate the accelerometer
+    auto fa = frameset.first(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F);
+    rs2::motion_frame accel = fa.as<rs2::motion_frame>();
+    {
+        std::lock_guard<std::mutex> guard(m_last_acc_mutex);
+        m_last_accel = accel.get_motion_data();
+    }
+
+    // the mutex is not required here since rotation_estimator is thread safe
+    const double ts = fg.get_timestamp();
+    m_rotation_estimator->process_gyro(m_last_gyro, ts);
+    m_rotation_estimator->process_accel(m_last_accel);
+}
+
+void realsense2withIMUDriver::run()
+{
+    using namespace std::chrono;
+    auto start = high_resolution_clock::now();
+
+    // std::lock_guard<std::mutex> guard(m_mutex);
+    rs2::frameset frameset;
+    if(!this->getNewFrame(frameset))
+    {
+        yCWarning(REALSENSE2WITHIMU) << "Unable to get a new frameset";
+        return;
+    }
+
+    auto stop = high_resolution_clock::now();
+    cout << "get frame "  << duration_cast<milliseconds>(stop - start).count() << endl;
+
+    // align the images if required
+    this->alignFrame(frameset);
+
+    // TODO this should be done only if required
+    // populate the yarp images
+    this->populateImages(frameset);
+
+    // understand when this is required
+    // TODO this should be done only if required
+    this->populateImuMeasurements(frameset);
+
+    stop = high_resolution_clock::now();
+    cout << "all "  << duration_cast<milliseconds>(stop - start).count() << endl;
+
 }
 
 bool realsense2withIMUDriver::close()
 {
-    pipelineShutdown();
+    this->stop();
     return true;
 }
 
@@ -366,25 +427,14 @@ bool realsense2withIMUDriver::getThreeAxisGyroscopeMeasure(size_t sens_index, ya
         return false;
     }
 
-    std::lock_guard<std::mutex> guard(realsense2Driver::m_mutex);
-    rs2::frameset dataframe;
-    try
-    {
-        dataframe = m_pipeline.wait_for_frames();
-    }
-    catch (const rs2::error& e)
-    {
-        yCError(REALSENSE2WITHIMU) << "m_pipeline.wait_for_frames() failed with error:"<< "(" << e.what() << ")";
-        m_lastError = e.what();
-        return false;
-    }
-    auto fg = dataframe.first(RS2_STREAM_GYRO, RS2_FORMAT_MOTION_XYZ32F);
-    rs2::motion_frame gyro = fg.as<rs2::motion_frame>();
-    m_last_gyro = gyro.get_motion_data();
     out.resize(3);
+    std::lock_guard<std::mutex> guard(m_last_gyro_mutex);
     out[0] = m_last_gyro.x;
     out[1] = m_last_gyro.y;
     out[2] = m_last_gyro.z;
+
+    // TODO add the timestamp
+
     return true;
 }
 
@@ -418,25 +468,15 @@ bool realsense2withIMUDriver::getThreeAxisLinearAccelerometerFrameName(size_t se
 
 bool realsense2withIMUDriver::getThreeAxisLinearAccelerometerMeasure(size_t sens_index, yarp::sig::Vector& out, double& timestamp) const
 {
-    std::lock_guard<std::mutex> guard(m_mutex);
-    rs2::frameset dataframe;
-    try
-    {
-        dataframe = m_pipeline.wait_for_frames();
-    }
-    catch (const rs2::error& e)
-    {
-        yCError(REALSENSE2WITHIMU) << "m_pipeline.wait_for_frames() failed with error:"<< "(" << e.what() << ")";
-        m_lastError = e.what();
-        return false;
-    }
-    auto fa = dataframe.first(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F);
-    rs2::motion_frame accel = fa.as<rs2::motion_frame>();
-    m_last_accel = accel.get_motion_data();
     out.resize(3);
+
+    std::lock_guard<std::mutex> guard(m_last_acc_mutex);
     out[0] = m_last_accel.x;
     out[1] = m_last_accel.y;
     out[2] = m_last_accel.z;
+
+    // TODO add the timestamp
+
     return true;
 }
 
@@ -482,46 +522,16 @@ bool realsense2withIMUDriver::getOrientationSensorFrameName(size_t sens_index, s
 bool realsense2withIMUDriver::getOrientationSensorMeasureAsRollPitchYaw(size_t sens_index, yarp::sig::Vector& rpy, double& timestamp) const
 {
     if (sens_index != 0) { return false; }
-    if (m_sensor_has_orientation_estimator)
+    if (!m_sensor_has_orientation_estimator)
     {
-        std::lock_guard<std::mutex> guard(m_mutex);
-        rs2::frameset dataframe;
-        try
-        {
-            dataframe = m_pipeline.wait_for_frames();
-        }
-        catch (const rs2::error& e)
-        {
-            yCError(REALSENSE2WITHIMU) << "m_pipeline.wait_for_frames() failed with error:"<< "(" << e.what() << ")";
-            m_lastError = e.what();
-            return false;
-        }
-        auto motion = dataframe.as<rs2::motion_frame>();
-        if (motion && motion.get_profile().stream_type() == RS2_STREAM_GYRO &&
-                      motion.get_profile().format() == RS2_FORMAT_MOTION_XYZ32F)
-        {
-            // Get the timestamp of the current frame
-            double ts = motion.get_timestamp();
-            // Get gyro measures
-            rs2_vector gyro_data = motion.get_motion_data();
-            // Call function that computes the angle of motion based on the retrieved measures
-            m_rotation_estimator->process_gyro(gyro_data, ts);
-        }
-        // If casting succeeded and the arrived frame is from accelerometer stream
-        if (motion && motion.get_profile().stream_type() == RS2_STREAM_ACCEL &&
-                      motion.get_profile().format() == RS2_FORMAT_MOTION_XYZ32F)
-        {
-            // Get accelerometer measures
-            rs2_vector accel_data = motion.get_motion_data();
-            // Call function that computes the angle of motion based on the retrieved measures
-            m_rotation_estimator->process_accel(accel_data);
-        }
-        float3 theta = m_rotation_estimator->get_theta();
-        rpy.resize(3);
-        rpy[0] = 0 + theta.x * 180.0 / M_PI; //here we can eventually adjust the sign and/or sum an offset
-        rpy[1] = 0 + theta.y * 180.0 / M_PI;
-        rpy[2] = 0 + theta.z * 180.0 / M_PI;
-        return true;
+        return false;
     }
-    return false;
+
+    float3 theta = m_rotation_estimator->get_theta();
+    rpy.resize(3);
+    rpy[0] = 0 + theta.x * 180.0 / M_PI; //here we can eventually adjust the sign and/or sum an offset
+    rpy[1] = 0 + theta.y * 180.0 / M_PI;
+    rpy[2] = 0 + theta.z * 180.0 / M_PI;
+
+    return true;
 }

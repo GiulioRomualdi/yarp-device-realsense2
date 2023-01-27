@@ -13,6 +13,7 @@
 
 #include <yarp/dev/DeviceDriver.h>
 #include <yarp/dev/MultipleAnalogSensorsInterfaces.h>
+#include <yarp/sig/Vector.h>
 
 #include "realsense2Driver.h"
 #include <cstring>
@@ -82,9 +83,13 @@ public:
 
 protected:
     // realsense classes
-    mutable rs2_vector m_last_gyro;
-    mutable rs2_vector m_last_accel;
-    mutable rs2_pose   m_last_pose;
+    rs2_vector m_last_gyro;
+    rs2_vector m_last_accel;
+    rs2_pose   m_last_pose;
+
+    mutable std::mutex m_last_gyro_mutex;
+    mutable std::mutex m_last_acc_mutex;
+
     std::unique_ptr<rotation_estimator> m_rotation_estimator;
 
     bool m_sensor_has_orientation_estimator;
@@ -101,6 +106,8 @@ protected:
     std::string m_positionFrameName;
     mutable std::string m_lastError;
 
+    double getHigherFrequency() const override;
+
     /*std::mutex   m_mutex;
     rs2::context m_ctx;
     rs2::config m_cfg;
@@ -115,6 +122,7 @@ protected:
     rs2_stream  m_alignment_stream{RS2_STREAM_COLOR};
 
 
+
     yarp::os::Stamp m_rgb_stamp;
     yarp::os::Stamp m_depth_stamp;
     yarp::dev::RGBDSensorParamParser m_paramParser;
@@ -125,5 +133,13 @@ protected:
     int m_fps;
     float m_scale;
     std::vector<cameraFeature_id_t> m_supportedFeatures;*/
+
+private:
+
+    double m_imuFrequency{100};
+
+    void populateImuMeasurements(const rs2::frameset& frameset);
+
+    void run() override;
 };
 #endif

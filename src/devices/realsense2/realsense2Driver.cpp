@@ -18,6 +18,11 @@
 #include <librealsense2/rsutil.h>
 #include "realsense2Driver.h"
 
+#include <chrono>
+#include <librealsense2/hpp/rs_processing.hpp>
+#include <mutex>
+
+
 using namespace yarp::dev;
 using namespace yarp::sig;
 using namespace yarp::os;
@@ -37,7 +42,7 @@ constexpr char framerate      [] = "framerate";
 constexpr char enableEmitter  [] = "enableEmitter";
 constexpr char needAlignment  [] = "needAlignment";
 constexpr char alignmentFrame [] = "alignmentFrame";
-
+constexpr double defaultRealsense2DriverPeriod = 0.01;
 
 static std::map<std::string, RGBDSensorParamParser::RGBDParam> params_map =
 {
@@ -429,7 +434,8 @@ static bool setExtrinsicParam(Matrix &extrinsic, const rs2_extrinsics &values)
     return false;
 }
 
-realsense2Driver::realsense2Driver() : m_depth_sensor(nullptr), m_color_sensor(nullptr),
+realsense2Driver::realsense2Driver() : yarp::os::PeriodicThread(defaultRealsense2DriverPeriod),
+                                       m_depth_sensor(nullptr), m_color_sensor(nullptr),
                                        m_paramParser(), m_verbose(false),
                                        m_initialized(false), m_stereoMode(false),
                                        m_needAlignment(true), m_fps(0),
@@ -448,6 +454,13 @@ realsense2Driver::realsense2Driver() : m_depth_sensor(nullptr), m_color_sensor(n
     m_supportedFeatures.push_back(YARP_FEATURE_SHARPNESS);
     m_supportedFeatures.push_back(YARP_FEATURE_HUE);
     m_supportedFeatures.push_back(YARP_FEATURE_SATURATION);
+}
+
+realsense2Driver::~realsense2Driver()
+{
+    // release the resource
+    std::lock_guard<std::mutex> guard(m_mutex);
+    this->pipelineShutdown();
 }
 
 bool realsense2Driver::pipelineStartup()
@@ -563,6 +576,7 @@ bool realsense2Driver::initializeRealsenseDevice()
             m_lastError = e.what();
         }
     }
+
     yCInfo(REALSENSE2) << "Device ready!";
 
     if (m_ctx.query_devices().size() == 0)
@@ -724,6 +738,13 @@ bool realsense2Driver::setParams()
         m_alignment_stream = stringRSStreamMap.at(alignmentFrameStr);
     }
 
+    // we build the align here since it is an expensive operation
+    // please check here:
+    if (m_alignment_stream != RS2_STREAM_ANY) // RS2_STREAM_ANY is used as no-alignment-needed value.
+    {
+        m_align = std::make_unique<rs2::align>(m_alignment_stream);
+    }
+
     //DEPTH_RES
     if (params_map[depthRes].isSetting && ret)
     {
@@ -763,8 +784,7 @@ bool realsense2Driver::setParams()
     return ret;
 }
 
-
-bool realsense2Driver::open(Searchable& config)
+bool realsense2Driver::configure(Searchable& config)
 {
     std::vector<RGBDSensorParamParser::RGBDParam*> params;
     params.reserve(params_map.size());
@@ -806,13 +826,101 @@ bool realsense2Driver::open(Searchable& config)
     }
 
     // setting Parameters
-    return setParams();
+    if(!setParams())
+    {
+        yCError(REALSENSE2) << "Failed to set realsense parameters";
+        return false;
+    }
 
+    this->setPeriod(1.0/double(getHigherFrequency()));
+
+    return true;
+}
+
+bool realsense2Driver::open(Searchable& config)
+{
+    if (!this->configure(config))
+    {
+        return false;
+    }
+    return this->start();
+}
+
+double realsense2Driver::getHigherFrequency() const
+{
+    return m_fps;
+}
+
+bool realsense2Driver::getNewFrame(rs2::frameset& frameset)
+{
+    // this mutex allows to safety restart and close device
+    return m_pipeline.try_wait_for_frames(&frameset);
+}
+
+void realsense2Driver::alignFrame(rs2::frameset& frameset)
+{
+    // if m_align is different from nullptr we should allign the frameset
+    if (m_align != nullptr)
+    {
+        frameset = m_align->process(frameset);
+    }
+}
+
+bool realsense2Driver::populateImages(const rs2::frameset& frameset)
+{
+    // the infrared is available only if m_stereoMode is set to true
+    if (m_stereoMode)
+    {
+        rs2::video_frame frm1 = frameset.get_infrared_frame(1);
+        rs2::video_frame frm2 = frameset.get_infrared_frame(2);
+
+        const int pixCode = pixFormatToCode(frm1.get_profile().format());
+
+        if (pixCode != VOCAB_PIXEL_MONO)
+        {
+            yCError(REALSENSE2) << "Expecting Pixel Format MONO";
+            return false;
+        }
+
+        // Wrap rs images with yarp ones.
+        ImageOf<PixelMono> imgL, imgR;
+        imgL.setExternal((unsigned char*) (frm1.get_data()), frm1.get_width(), frm1.get_height());
+        imgR.setExternal((unsigned char*) (frm2.get_data()), frm2.get_width(), frm2.get_height());
+
+        // lock the infrared mutex only for the required time
+        {
+            std::lock_guard<std::mutex> guard(m_infraredFrameMutex);
+            utils::horzConcat(imgL, imgR, m_infraredFrame);
+        }
+    }
+
+    std::lock_guard<std::mutex> guard(m_rgbdFrameMutex);
+    m_colorFrameAvailable = this->getImage(m_colorFrame, frameset);
+    m_depthFrameAvailable = this->getImage(m_depthFrame, frameset);
+
+    return true;
+}
+
+void realsense2Driver::run()
+{
+    std::lock_guard<std::mutex> guard(m_mutex);
+    rs2::frameset frameset;
+    if(!this->getNewFrame(frameset))
+    {
+        yCWarning(REALSENSE2) << "Unable to get a new frameset";
+        return;
+    }
+
+    // align the images if required
+    this->alignFrame(frameset);
+
+    // populate the yarp images
+    this->populateImages(frameset);
 }
 
 bool realsense2Driver::close()
 {
-    pipelineShutdown();
+    this->stop();
     return true;
 }
 
@@ -1023,55 +1131,49 @@ bool realsense2Driver::getExtrinsicParam(Matrix& extrinsic)
 
 bool realsense2Driver::getRgbImage(FlexImage& rgbImage, Stamp* timeStamp)
 {
-    std::lock_guard<std::mutex> guard(m_mutex);
-    rs2::frameset data;
-    try
+    std::lock_guard<std::mutex> guard(m_rgbdFrameMutex);
+
+    if (!m_colorFrameAvailable)
     {
-        data = m_pipeline.wait_for_frames();
-    }
-    catch (const rs2::error& e)
-    {
-        yCError(REALSENSE2) << "m_pipeline.wait_for_frames() failed with error:"<< "(" << e.what() << ")";
-         m_lastError = e.what();
         return false;
     }
-    if (m_alignment_stream == RS2_STREAM_DEPTH)
+
+    rgbImage = m_colorFrame;
+
+    if (timeStamp != nullptr)
     {
-        rs2::align align(m_alignment_stream);
-        data = align.process(data);
+        *timeStamp = m_rgb_stamp;
     }
-    return getImage(rgbImage, timeStamp, data);
+
+    return true;
 }
 
 bool realsense2Driver::getDepthImage(ImageOf<PixelFloat>& depthImage, Stamp* timeStamp)
 {
-    std::lock_guard<std::mutex> guard(m_mutex);
-    rs2::frameset data;
-    try
+    std::lock_guard<std::mutex> guard(m_rgbdFrameMutex);
+
+    if (!m_depthFrameAvailable)
     {
-        data = m_pipeline.wait_for_frames();
-    }
-    catch (const rs2::error& e)
-    {
-        yCError(REALSENSE2) << "m_pipeline.wait_for_frames() failed with error:"<< "(" << e.what() << ")";
-        m_lastError = e.what();
         return false;
     }
-    if (m_alignment_stream == RS2_STREAM_COLOR)
+
+    depthImage = m_depthFrame;
+
+    if (timeStamp != nullptr)
     {
-        rs2::align align(m_alignment_stream);
-        data = align.process(data);
+        *timeStamp = m_depth_stamp;
     }
-    return getImage(depthImage, timeStamp, data);
+
+    return true;
 }
 
-bool realsense2Driver::getImage(FlexImage& Frame, Stamp *timeStamp, rs2::frameset &sourceFrame)
+bool realsense2Driver::getImage(FlexImage& Frame, const rs2::frameset &sourceFrame)
 {
     rs2::video_frame color_frm = sourceFrame.get_color_frame();
     rs2_format format = color_frm.get_profile().format();
 
-    int pixCode = pixFormatToCode(format);
-    size_t mem_to_wrt = color_frm.get_width() * color_frm.get_height() * bytesPerPixel(format);
+    const int pixCode = pixFormatToCode(format);
+    const size_t mem_to_wrt = color_frm.get_width() * color_frm.get_height() * bytesPerPixel(format);
 
     if (pixCode == VOCAB_PIXEL_INVALID)
     {
@@ -1097,15 +1199,14 @@ bool realsense2Driver::getImage(FlexImage& Frame, Stamp *timeStamp, rs2::framese
     } else {
         memcpy((void*)Frame.getRawImage(), (void*)color_frm.get_data(), mem_to_wrt);
     }
+
+    // update the stamp
     m_rgb_stamp.update();
-    if (timeStamp != nullptr)
-    {
-        *timeStamp = m_rgb_stamp;
-    }
+
     return true;
 }
 
-bool realsense2Driver::getImage(depthImage& Frame, Stamp *timeStamp, const rs2::frameset &sourceFrame)
+bool realsense2Driver::getImage(depthImage& Frame,  const rs2::frameset &sourceFrame)
 {
     rs2::depth_frame depth_frm = sourceFrame.get_depth_frame();
     rs2_format format = depth_frm.get_profile().format();
@@ -1144,33 +1245,33 @@ bool realsense2Driver::getImage(depthImage& Frame, Stamp *timeStamp, const rs2::
     }
 
     m_depth_stamp.update();
-    if (timeStamp != nullptr)
-    {
-        *timeStamp = m_depth_stamp;
-    }
+
     return true;
 }
 
 bool realsense2Driver::getImages(FlexImage& colorFrame, ImageOf<PixelFloat>& depthFrame, Stamp* colorStamp, Stamp* depthStamp)
 {
-    std::lock_guard<std::mutex> guard(m_mutex);
-    rs2::frameset data;
-    try
+    std::lock_guard<std::mutex> guard(m_rgbdFrameMutex);
+
+    if (!m_colorFrameAvailable && !m_depthFrameAvailable)
     {
-        data = m_pipeline.wait_for_frames();
-    }
-    catch (const rs2::error& e)
-    {
-        yCError(REALSENSE2) << "m_pipeline.wait_for_frames() failed with error:"<< "(" << e.what() << ")";
-        m_lastError = e.what();
         return false;
     }
-    if (m_alignment_stream != RS2_STREAM_ANY) // RS2_STREAM_ANY is used as no-alignment-needed value.
+
+    colorFrame = m_colorFrame;
+    depthFrame = m_depthFrame;
+
+    if (colorStamp != nullptr)
     {
-        rs2::align align(m_alignment_stream);
-        data = align.process(data);
+        *colorStamp = m_rgb_stamp;
     }
-    return getImage(colorFrame, colorStamp, data) && getImage(depthFrame, depthStamp, data);
+
+    if (depthStamp != nullptr)
+    {
+        *colorStamp = m_depth_stamp;
+    }
+
+    return true;
 }
 
 IRGBDSensor::RGBDSensor_status realsense2Driver::getSensorStatus()
@@ -1600,36 +1701,16 @@ bool realsense2Driver::getImage(yarp::sig::ImageOf<yarp::sig::PixelMono>& image)
         return false;
     }
 
-    image.resize(width(), height());
-    std::lock_guard<std::mutex> guard(m_mutex);
-    rs2::frameset data;
-    try
+    std::lock_guard<std::mutex> guard(m_infraredFrameMutex);
+
+    if (!m_infraredFrameAvailable)
     {
-        data = m_pipeline.wait_for_frames();
-    }
-    catch (const rs2::error& e)
-    {
-        yCError(REALSENSE2) << "m_pipeline.wait_for_frames() failed with error:"<< "(" << e.what() << ")";
-        m_lastError = e.what();
+        yCError(REALSENSE2)<<"Infrared stereo stream not available";
         return false;
     }
 
-    rs2::video_frame frm1 = data.get_infrared_frame(1);
-    rs2::video_frame frm2 = data.get_infrared_frame(2);
-
-    int pixCode = pixFormatToCode(frm1.get_profile().format());
-
-    if (pixCode != VOCAB_PIXEL_MONO)
-    {
-        yCError(REALSENSE2) << "Expecting Pixel Format MONO";
-        return false;
-    }
-
-    // Wrap rs images with yarp ones.
-    ImageOf<PixelMono> imgL, imgR;
-    imgL.setExternal((unsigned char*) (frm1.get_data()), frm1.get_width(), frm1.get_height());
-    imgR.setExternal((unsigned char*) (frm2.get_data()), frm2.get_width(), frm2.get_height());
-    return utils::horzConcat(imgL, imgR, image);
+    image = m_infraredFrame;
+    return true;
 }
 
 int  realsense2Driver::height() const
