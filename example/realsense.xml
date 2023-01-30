@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE robot PUBLIC "-//YARP//DTD yarprobotinterface 3.0//EN" "http://www.yarp.it/DTD/yarprobotinterfaceV3.0.dtd">
+<robot name="realsense" build=0 portprefix="/depthCamera">
+
+  <device type="realsense2withIMU" name="camera">
+    <group name="SETTINGS">
+      <param name="depthResolution">(640 480)</param>
+      <param name="rgbResolution">(640 480)</param>
+      <param name="framerate">30</param>
+      <param name="enableEmitter">true</param>
+      <param name="alignmentFrame">RGB</param>
+    </group>
+
+    <group name="HW_DESCRIPTION">
+      <param name="clipPlanes">(0.2 10.0)</param>
+    </group>
+  </device>
+
+  <device type="RGBDSensorWrapper" name="rgbd_sensor_wrapper">
+    <param name="period">20</param>
+    <param name="name">/depthCamera</param>
+
+    <action phase="startup" level="5" type="attach">
+      <paramlist name="networks">
+        <elem name="camera">camera</elem>
+      </paramlist>
+    </action>
+    <action phase="shutdown" level="5" type="detach"/>
+  </device>
+
+  <device type="multipleanalogsensorsserver" name="imu_sensor_wrapper">
+    <param name="period">100</param>
+    <param name="name">/depthCamera_imu</param>
+
+    <action phase="startup" level="5" type="attach">
+      <paramlist name="networks">
+        <elem name="camera">camera</elem>
+      </paramlist>
+    </action>
+    <action phase="shutdown" level="5" type="detach"/>
+  </device>
+
+</robot>
